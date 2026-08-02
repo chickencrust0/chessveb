@@ -1,6 +1,6 @@
 import logging
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
@@ -10,7 +10,8 @@ from database import Database
 from alfacrm_client import AlfaCRMClient, AlfaCRMError
 from bot.keyboards import transfer_decision_keyboard
 from bot.states import BroadcastStates, ManagerSummaryStates
-from bot.handlers.common import get_lesson_summary
+from bot.formatting import fmt_date_long, lesson_date_iso
+from bot.handlers.common import answer_blocks, get_lesson_summary
 
 logger = logging.getLogger(__name__)
 router = Router(name="manager")
@@ -21,6 +22,17 @@ BRANCH_ID = os.getenv('BRANCH_ID', '1')
 
 def _is_manager(telegram_id: int) -> bool:
     return telegram_id in MANAGER_IDS
+
+
+def _parse_date(text: str):
+    """Принимает ГГГГ-ММ-ДД и ДД.ММ.ГГГГ, возвращает date или None."""
+    text = (text or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
 # ==================== РАССЫЛКА ====================
@@ -49,27 +61,31 @@ async def broadcast_choose(message: Message, state: FSMContext) -> None:
 async def broadcast_execute(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
     if not _is_manager(callback.from_user.id):
         return
+
     action = callback.data.split(":")[1]
     if action == "cancel":
         await state.clear()
         await callback.message.edit_text("❌ Отменено.")
         return
+
     data = await state.get_data()
     text = data.get("broadcast_text", "")
-    recipients = []
+
     if action == "teacher":
         recipients = db.get_all_users_by_role("teacher")
     elif action == "parent":
         recipients = db.get_all_users_by_role("parent")
     else:
         recipients = db.get_all_users_by_role("teacher") + db.get_all_users_by_role("parent")
+
     success = 0
     for user in recipients:
         try:
             await callback.bot.send_message(user["telegram_id"], f"📢 {text}")
             success += 1
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Рассылка не дошла до {user['telegram_id']}: {e}")
+
     await callback.message.edit_text(f"✅ Отправлено: {success}/{len(recipients)}")
     await state.clear()
 
@@ -80,16 +96,22 @@ async def broadcast_execute(callback: CallbackQuery, state: FSMContext, db: Data
 async def transfer_list(message: Message, db: Database) -> None:
     if not _is_manager(message.from_user.id):
         return
+
     requests = db.get_pending_transfer_requests()
     if not requests:
         await message.answer("📭 Заявок нет.")
         return
+
     for req in requests:
+        created = req.get("created_at") or "—"
         await message.answer(
-            f"🔁 Заявка №{req['id']}\n"
-            f"👤 {req.get('teacher_name', '—')}\n"
-            f"💬 {req.get('comment', '—')}",
-            reply_markup=transfer_decision_keyboard(req['id'])
+            f"🔁 <b>Заявка №{req['id']}</b>\n\n"
+            f"📅 <b>Создана:</b> {created}\n"
+            f"👤 <b>От кого:</b> {req.get('teacher_name', '—')}\n"
+            f"🆔 <b>Урок ID:</b> {req.get('lesson_id', '—')}\n"
+            f"💬 <b>Комментарий:</b> {req.get('comment', '—')}",
+            parse_mode="HTML",
+            reply_markup=transfer_decision_keyboard(req['id']),
         )
 
 
@@ -102,9 +124,11 @@ async def transfer_approve(callback: CallbackQuery, db: Database) -> None:
     if request:
         db.resolve_transfer_request(request_id, "approved", callback.from_user.id)
         try:
-            await callback.bot.send_message(request["teacher_telegram_id"], f"✅ Заявка №{request_id} одобрена!")
-        except Exception:
-            pass
+            await callback.bot.send_message(
+                request["teacher_telegram_id"], f"✅ Заявка №{request_id} одобрена!"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить автора заявки {request_id}: {e}")
     await callback.message.edit_text(f"✅ Заявка №{request_id} одобрена.")
     await callback.answer()
 
@@ -118,9 +142,11 @@ async def transfer_reject(callback: CallbackQuery, db: Database) -> None:
     if request:
         db.resolve_transfer_request(request_id, "rejected", callback.from_user.id)
         try:
-            await callback.bot.send_message(request["teacher_telegram_id"], f"❌ Заявка №{request_id} отклонена.")
-        except Exception:
-            pass
+            await callback.bot.send_message(
+                request["teacher_telegram_id"], f"❌ Заявка №{request_id} отклонена."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить автора заявки {request_id}: {e}")
     await callback.message.edit_text(f"❌ Заявка №{request_id} отклонена.")
     await callback.answer()
 
@@ -131,79 +157,89 @@ async def transfer_reject(callback: CallbackQuery, db: Database) -> None:
 async def summary_period_start(message: Message, state: FSMContext) -> None:
     if not _is_manager(message.from_user.id):
         return
-    logger.info(f"🔔 Менеджер {message.from_user.id} запросил сводку за период")
     await state.set_state(ManagerSummaryStates.waiting_for_date_from)
-    logger.info(f"Состояние установлено: {await state.get_state()}")
+    today = datetime.now().date()
     await message.answer(
-        "📅 Введите начальную дату в формате <b>YYYY-MM-DD</b>\n"
-        "Пример: <code>2026-07-30</code>",
-        parse_mode="HTML"
+        "📅 Введите <b>начальную</b> дату.\n"
+        f"Формат: <code>{today.isoformat()}</code> или <code>{today.strftime('%d.%m.%Y')}</code>",
+        parse_mode="HTML",
     )
 
 
 @router.message(ManagerSummaryStates.waiting_for_date_from, F.text)
 async def summary_date_from(message: Message, state: FSMContext) -> None:
-    logger.info(f"📅 ХЕНДЛЕР СРАБОТАЛ! Введена начальная дата: {message.text}")
-    date_from = message.text.strip()
-    try:
-        datetime.strptime(date_from, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введите дату как <b>YYYY-MM-DD</b>", parse_mode="HTML")
+    parsed = _parse_date(message.text)
+    if not parsed:
+        await message.answer(
+            "❌ Не понял дату. Введите как <b>ГГГГ-ММ-ДД</b> или <b>ДД.ММ.ГГГГ</b>",
+            parse_mode="HTML",
+        )
         return
-    await state.update_data(date_from=date_from)
+
+    await state.update_data(date_from=parsed.isoformat())
     await state.set_state(ManagerSummaryStates.waiting_for_date_to)
-    logger.info(f"Переход к вводу конечной даты, состояние: {await state.get_state()}")
-    await message.answer("📅 Введите конечную дату в формате <b>YYYY-MM-DD</b>", parse_mode="HTML")
+    await message.answer(
+        "📅 Теперь <b>конечную</b> дату.\n"
+        "<i>Отправьте «-», чтобы взять тот же день.</i>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(ManagerSummaryStates.waiting_for_date_to, F.text)
-async def summary_date_to(message: Message, state: FSMContext, db: Database, alfacrm: AlfaCRMClient) -> None:
-    logger.info(f"📅 ХЕНДЛЕР СРАБОТАЛ! Введена конечная дата: {message.text}")
+async def summary_date_to(
+    message: Message, state: FSMContext, db: Database, alfacrm: AlfaCRMClient
+) -> None:
     if not _is_manager(message.from_user.id):
         await state.clear()
         return
-    date_to = message.text.strip()
-    try:
-        datetime.strptime(date_to, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введите дату как <b>YYYY-MM-DD</b>", parse_mode="HTML")
-        return
+
     data = await state.get_data()
     date_from = data["date_from"]
+
+    if message.text.strip() in ("-", "—"):
+        date_to = date_from
+    else:
+        parsed = _parse_date(message.text)
+        if not parsed:
+            await message.answer(
+                "❌ Не понял дату. Введите как <b>ГГГГ-ММ-ДД</b> или <b>ДД.ММ.ГГГГ</b>",
+                parse_mode="HTML",
+            )
+            return
+        date_to = parsed.isoformat()
+
     await state.clear()
 
-    logger.info(f"📅 Запрос сводки за период {date_from} – {date_to} (branch_id={BRANCH_ID})")
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    await message.answer("🔍 Собираю сводку…")
+    logger.info(f"📅 Сводка за {date_from} – {date_to} (branch_id={BRANCH_ID})")
+
     try:
-        lessons = await alfacrm.get_lessons(date_from=date_from, date_to=date_to)
-        logger.info(f"📊 Получено {len(lessons)} уроков")
-        if not lessons:
-            await message.answer(f"📊 Сводка за {date_from} – {date_to}\n\nЗа этот период уроков не было.")
-            return
+        all_lessons = await alfacrm.get_lessons(date_from=date_from, date_to=date_to)
+        lessons = [l for l in all_lessons if date_from <= lesson_date_iso(l) <= date_to]
+        logger.info(f"📊 Получено {len(all_lessons)}, после фильтра по датам {len(lessons)}")
     except Exception as e:
         logger.error(f"❌ Ошибка получения уроков: {e}", exc_info=True)
         await message.answer(f"❌ Ошибка получения уроков: {e}")
         return
 
-    if lessons:
-        for i, l in enumerate(lessons[:5]):
-            logger.info(f"  Урок {i+1}: id={l.get('id')}, date={l.get('date')}, status={l.get('status')}")
+    if date_from == date_to:
+        period_label = f"за {fmt_date_long(datetime.strptime(date_from, '%Y-%m-%d').date())}"
+    else:
+        period_label = f"за период {date_from} – {date_to}"
 
-    period_label = f"за {date_from} – {date_to}"
     try:
-        summary_text = await get_lesson_summary(lessons, db, alfacrm, period_label)
-        logger.info(f"📝 Сводка сформирована, длина {len(summary_text)} символов")
+        blocks = await get_lesson_summary(lessons, db, alfacrm, period_label)
     except Exception as e:
         logger.error(f"❌ Ошибка формирования сводки: {e}", exc_info=True)
         await message.answer(f"❌ Ошибка формирования сводки: {e}")
         return
 
     try:
-        if len(summary_text) > 4096:
-            for x in range(0, len(summary_text), 4096):
-                await message.answer(summary_text[x:x+4096], parse_mode="HTML")
-        else:
-            await message.answer(summary_text, parse_mode="HTML")
-        logger.info("✅ Сводка отправлена")
+        await answer_blocks(message, blocks)
+        logger.info(f"✅ Сводка отправлена ({len(blocks)} сообщений)")
     except Exception as e:
         logger.error(f"❌ Ошибка отправки сообщения: {e}", exc_info=True)
         await message.answer(f"❌ Ошибка отправки: {e}")
