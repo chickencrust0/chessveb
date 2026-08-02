@@ -4,327 +4,242 @@ from datetime import datetime, timedelta
 
 from aiogram import Router, F
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-from alfacrm_client import AlfaCRMClient, AlfaCRMError
 from database import Database
-from bot.keyboards import lesson_action_keyboard, transfer_decision_keyboard
-from bot.states import HomeworkStates, TransferStates
+from alfacrm_client import AlfaCRMClient, AlfaCRMError
+from bot.keyboards import transfer_decision_keyboard
+from bot.states import BroadcastStates, ManagerSummaryStates
+from bot.formatting import fmt_date_long, lesson_date_iso
+from bot.handlers.common import answer_blocks, get_lesson_summary
 
 logger = logging.getLogger(__name__)
-router = Router(name="teacher")
+router = Router(name="manager")
 
-STATUS_PLANNED = int(os.getenv('STATUS_PLANNED', '1'))
-STATUS_CANCELLED = int(os.getenv('STATUS_CANCELLED', '2'))
-STATUS_CONDUCTED = int(os.getenv('STATUS_CONDUCTED', '3'))
 MANAGER_IDS = [int(x.strip()) for x in os.getenv('ADMIN_TELEGRAM_IDS', '').split(',') if x.strip().isdigit()]
+BRANCH_ID = os.getenv('BRANCH_ID', '1')
 
 
-class DateRangeStates(StatesGroup):
-    waiting_for_date_from = State()
-    waiting_for_date_to = State()
+def _is_manager(telegram_id: int) -> bool:
+    return telegram_id in MANAGER_IDS
 
 
-def _is_teacher(db: Database, telegram_id: int) -> bool:
-    user = db.get_user(telegram_id)
-    return bool(user and user["role"] == "teacher")
+def _parse_date(text: str):
+    """Принимает ГГГГ-ММ-ДД и ДД.ММ.ГГГГ, возвращает date или None."""
+    text = (text or "").strip()
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
 
 
-def _get_status_emoji(status: int) -> str:
-    return {1: "📌", 2: "❌", 3: "✅"}.get(status, "❓")
+# ==================== РАССЫЛКА ====================
+
+@router.message(F.text == "📢 Рассылка")
+async def broadcast_start(message: Message, state: FSMContext) -> None:
+    if not _is_manager(message.from_user.id):
+        return
+    await state.set_state(BroadcastStates.waiting_for_text)
+    await message.answer("📢 Введите текст рассылки.")
 
 
-def _get_status_text(status: int) -> str:
-    return {1: "Запланирован", 2: "Отменён", 3: "Проведён"}.get(status, "Неизвестно")
-
-
-async def _get_customer_name(alfacrm: AlfaCRMClient, customer_id: int) -> str:
-    customer = await alfacrm.get_customer_info(customer_id)
-    return alfacrm.extract_user_name(customer) if customer else f"ID:{customer_id}"
-
-
-@router.message(F.text == "📅 Моё расписание")
-async def teacher_schedule_menu(message: Message, state: FSMContext) -> None:
+@router.message(BroadcastStates.waiting_for_text, F.text)
+async def broadcast_choose(message: Message, state: FSMContext) -> None:
+    await state.update_data(broadcast_text=message.text)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📅 Сегодня", callback_data="schedule:today")],
-        [InlineKeyboardButton(text="📅 Завтра", callback_data="schedule:tomorrow")],
-        [InlineKeyboardButton(text="📅 Неделя", callback_data="schedule:week")],
-        [InlineKeyboardButton(text="📅 Месяц", callback_data="schedule:month")],
-        [InlineKeyboardButton(text="📅 Свой период", callback_data="schedule:custom")],
+        [InlineKeyboardButton(text="👨‍🏫 Преподавателям", callback_data="broadcast:teacher")],
+        [InlineKeyboardButton(text="👨‍👩‍👧 Родителям", callback_data="broadcast:parent")],
+        [InlineKeyboardButton(text="👥 Всем", callback_data="broadcast:all")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast:cancel")],
     ])
-    
-    await message.answer("📅 <b>Выберите период:</b>", reply_markup=keyboard, parse_mode="HTML")
+    await message.answer("Кому отправить?", reply_markup=keyboard)
 
 
-@router.callback_query(F.data == "schedule:custom")
-async def custom_date_from(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(DateRangeStates.waiting_for_date_from)
-    await callback.message.edit_text("📅 Введите начальную дату в формате <b>YYYY-MM-DD</b>\nПример: <code>2026-07-30</code>", parse_mode="HTML")
-    await callback.answer()
-
-
-@router.message(DateRangeStates.waiting_for_date_from, F.text)
-async def custom_date_to(message: Message, state: FSMContext) -> None:
-    date_from = message.text.strip()
-    try:
-        datetime.strptime(date_from, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введите дату как <b>YYYY-MM-DD</b>", parse_mode="HTML")
+@router.callback_query(F.data.startswith("broadcast:"))
+async def broadcast_execute(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    if not _is_manager(callback.from_user.id):
         return
-    
-    await state.update_data(date_from=date_from)
-    await state.set_state(DateRangeStates.waiting_for_date_to)
-    await message.answer("📅 Введите конечную дату в формате <b>YYYY-MM-DD</b>", parse_mode="HTML")
 
-
-@router.message(DateRangeStates.waiting_for_date_to, F.text)
-async def show_custom_schedule(message: Message, state: FSMContext, db: Database, alfacrm: AlfaCRMClient) -> None:
-    user = db.get_user(message.from_user.id)
-    if not user or user["role"] != "teacher":
+    action = callback.data.split(":")[1]
+    if action == "cancel":
         await state.clear()
+        await callback.message.edit_text("❌ Отменено.")
         return
-    
-    date_to = message.text.strip()
-    try:
-        datetime.strptime(date_to, "%Y-%m-%d")
-    except ValueError:
-        await message.answer("❌ Неверный формат. Введите дату как <b>YYYY-MM-DD</b>", parse_mode="HTML")
-        return
-    
+
     data = await state.get_data()
-    date_from = data["date_from"]
-    await state.clear()
-    
-    await show_schedule(message, db, alfacrm, user, date_from, date_to)
+    text = data.get("broadcast_text", "")
 
-
-@router.callback_query(F.data.startswith("schedule:"))
-async def handle_schedule_period(callback: CallbackQuery, db: Database, alfacrm: AlfaCRMClient) -> None:
-    user = db.get_user(callback.from_user.id)
-    if not user or user["role"] != "teacher":
-        await callback.answer("❌ Только для преподавателей.", show_alert=True)
-        return
-    
-    period = callback.data.split(":")[1]
-    today = datetime.now().date()
-    
-    if period == "today":
-        date_from = today.isoformat()
-        date_to = today.isoformat()
-    elif period == "tomorrow":
-        tomorrow = today + timedelta(days=1)
-        date_from = tomorrow.isoformat()
-        date_to = tomorrow.isoformat()
-    elif period == "week":
-        date_from = today.isoformat()
-        date_to = (today + timedelta(days=7)).isoformat()
-    elif period == "month":
-        date_from = today.isoformat()
-        date_to = (today + timedelta(days=30)).isoformat()
+    if action == "teacher":
+        recipients = db.get_all_users_by_role("teacher")
+    elif action == "parent":
+        recipients = db.get_all_users_by_role("parent")
     else:
-        await callback.answer()
+        recipients = db.get_all_users_by_role("teacher") + db.get_all_users_by_role("parent")
+
+    success = 0
+    for user in recipients:
+        try:
+            await callback.bot.send_message(user["telegram_id"], f"📢 {text}")
+            success += 1
+        except Exception as e:
+            logger.warning(f"Рассылка не дошла до {user['telegram_id']}: {e}")
+
+    await callback.message.edit_text(f"✅ Отправлено: {success}/{len(recipients)}")
+    await state.clear()
+
+
+# ==================== ЗАЯВКИ НА ПЕРЕНОС ====================
+
+@router.message(F.text == "🔁 Заявки на перенос")
+async def transfer_list(message: Message, db: Database) -> None:
+    if not _is_manager(message.from_user.id):
         return
-    
-    await callback.message.edit_text(f"🔍 Ищу уроки с <b>{date_from}</b> по <b>{date_to}</b>...", parse_mode="HTML")
-    await callback.answer()
-    await show_schedule(callback.message, db, alfacrm, user, date_from, date_to)
 
+    requests = db.get_pending_transfer_requests()
+    if not requests:
+        await message.answer("📭 Заявок нет.")
+        return
 
-async def show_schedule(message: Message, db: Database, alfacrm: AlfaCRMClient, user, date_from: str, date_to: str):
-    try:
-        all_lessons = await alfacrm.get_lessons(
-            teacher_id=user["crm_id"],
-            status=1,
-            date_from=date_from,
-            date_to=date_to
-        )
-        
-        if not all_lessons:
-            await message.answer(
-                f"📅 Нет уроков в период с <b>{date_from}</b> по <b>{date_to}</b>",
-                parse_mode="HTML"
-            )
-            return
-        
+    for req in requests:
+        created = req.get("created_at") or "—"
         await message.answer(
-            f"📅 <b>Расписание</b> ({date_from} – {date_to})\nНайдено уроков: <b>{len(all_lessons)}</b>\n",
-            parse_mode="HTML"
+            f"🔁 <b>Заявка №{req['id']}</b>\n\n"
+            f"📅 <b>Создана:</b> {created}\n"
+            f"👤 <b>От кого:</b> {req.get('teacher_name', '—')}\n"
+            f"🆔 <b>Урок ID:</b> {req.get('lesson_id', '—')}\n"
+            f"💬 <b>Комментарий:</b> {req.get('comment', '—')}",
+            parse_mode="HTML",
+            reply_markup=transfer_decision_keyboard(req['id']),
         )
-        
-        customer_names = {}
-        
-        for lesson in sorted(all_lessons, key=lambda l: l.get("time_from", "")):
-            date = lesson.get("date", "—")
-            time_from = lesson.get("time_from", "")[-8:-3] if lesson.get("time_from") else "??:??"
-            time_to = lesson.get("time_to", "")[-8:-3] if lesson.get("time_to") else "??:??"
-            status = lesson.get("status", 0)
-            lesson_type = lesson.get("lesson_type_name", "Урок")
-            topic = lesson.get("topic", "")
-            
-            customer_ids = lesson.get("customer_ids", [])
-            names = []
-            for cid in customer_ids:
-                if cid not in customer_names:
-                    customer_names[cid] = await _get_customer_name(alfacrm, cid)
-                names.append(customer_names[cid])
-            
-            card = (
-                f"{_get_status_emoji(status)} <b>{date}</b> | 🕐 {time_from} – {time_to}\n"
-                f"👤 <b>{', '.join(names)}</b>\n"
-                f"📊 {lesson_type} | {_get_status_text(status)}"
-            )
-            if topic:
-                card += f"\n📝 {topic}"
-            
-            await message.answer(
-                card,
-                parse_mode="HTML",
-                reply_markup=lesson_action_keyboard(lesson["id"])
-            )
-    
-    except AlfaCRMError as e:
-        await message.answer(f"❌ Ошибка получения расписания: {e}")
 
 
-@router.message(F.text == "📊 Отчёт по урокам")
-async def teacher_report(message: Message, db: Database, alfacrm: AlfaCRMClient) -> None:
-    user = db.get_user(message.from_user.id)
-    if not user or user["role"] != "teacher":
+@router.callback_query(F.data.startswith("transfer_ok:"))
+async def transfer_approve(callback: CallbackQuery, db: Database) -> None:
+    if not _is_manager(callback.from_user.id):
         return
+    request_id = int(callback.data.split(":")[1])
+    request = db.get_transfer_request(request_id)
+    if request:
+        db.resolve_transfer_request(request_id, "approved", callback.from_user.id)
+        try:
+            await callback.bot.send_message(
+                request["teacher_telegram_id"], f"✅ Заявка №{request_id} одобрена!"
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить автора заявки {request_id}: {e}")
+    await callback.message.edit_text(f"✅ Заявка №{request_id} одобрена.")
+    await callback.answer()
 
-    date_from = (datetime.now().date() - timedelta(days=30)).isoformat()
-    
-    try:
-        all_lessons = await alfacrm.get_lessons(
-            teacher_id=user["crm_id"],
-            date_from=date_from
-        )
-    except AlfaCRMError as e:
-        await message.answer(f"❌ Ошибка: {e}")
+
+@router.callback_query(F.data.startswith("transfer_no:"))
+async def transfer_reject(callback: CallbackQuery, db: Database) -> None:
+    if not _is_manager(callback.from_user.id):
         return
+    request_id = int(callback.data.split(":")[1])
+    request = db.get_transfer_request(request_id)
+    if request:
+        db.resolve_transfer_request(request_id, "rejected", callback.from_user.id)
+        try:
+            await callback.bot.send_message(
+                request["teacher_telegram_id"], f"❌ Заявка №{request_id} отклонена."
+            )
+        except Exception as e:
+            logger.warning(f"Не удалось уведомить автора заявки {request_id}: {e}")
+    await callback.message.edit_text(f"❌ Заявка №{request_id} отклонена.")
+    await callback.answer()
 
-    total = len(all_lessons)
-    conducted = sum(1 for l in all_lessons if l.get("status") == STATUS_CONDUCTED)
-    cancelled = sum(1 for l in all_lessons if l.get("status") == STATUS_CANCELLED)
-    not_closed = total - conducted - cancelled
-    with_hw = sum(1 for l in all_lessons if l.get("homework") and l["homework"].strip())
 
+# ==================== СВОДКА ЗА ПЕРИОД ====================
+
+@router.message(F.text == "📊 Сводка за период")
+async def summary_period_start(message: Message, state: FSMContext) -> None:
+    if not _is_manager(message.from_user.id):
+        return
+    await state.set_state(ManagerSummaryStates.waiting_for_date_from)
+    today = datetime.now().date()
     await message.answer(
-        f"📊 <b>Отчёт за 30 дней</b>\n\n"
-        f"📅 Всего: {total}\n"
-        f"✅ Проведено: {conducted}\n"
-        f"❌ Отменено: {cancelled}\n"
-        f"⚠️ Не закрыто: {not_closed}\n\n"
-        f"📚 С ДЗ: {with_hw}\n"
-        f"📝 Без ДЗ: {conducted - with_hw}\n\n"
-        f"{'⚠️ Есть незакрытые уроки!' if not_closed > 0 else '✅ Все уроки закрыты!'}",
-        parse_mode="HTML"
+        "📅 Введите <b>начальную</b> дату.\n"
+        f"Формат: <code>{today.isoformat()}</code> или <code>{today.strftime('%d.%m.%Y')}</code>",
+        parse_mode="HTML",
     )
 
 
-@router.callback_query(F.data.startswith("close:"))
-async def close_lesson(callback: CallbackQuery, db: Database, alfacrm: AlfaCRMClient) -> None:
-    user = db.get_user(callback.from_user.id)
-    if not user or user["role"] != "teacher":
-        await callback.answer("❌ Доступно только преподавателям.", show_alert=True)
+@router.message(ManagerSummaryStates.waiting_for_date_from, F.text)
+async def summary_date_from(message: Message, state: FSMContext) -> None:
+    parsed = _parse_date(message.text)
+    if not parsed:
+        await message.answer(
+            "❌ Не понял дату. Введите как <b>ГГГГ-ММ-ДД</b> или <b>ДД.ММ.ГГГГ</b>",
+            parse_mode="HTML",
+        )
         return
 
-    lesson_id = int(callback.data.split(":")[1])
-    
-    try:
-        await alfacrm.mark_lesson_conducted(lesson_id)
-        db.mark_close_reminder_sent(lesson_id, callback.from_user.id)
-        await callback.message.edit_text(f"{callback.message.text}\n\n✅ Проведён!")
-        await callback.answer("✅ Урок проведён!")
-    except AlfaCRMError as e:
-        await callback.answer(f"❌ Ошибка: {e}", show_alert=True)
+    await state.update_data(date_from=parsed.isoformat())
+    await state.set_state(ManagerSummaryStates.waiting_for_date_to)
+    await message.answer(
+        "📅 Теперь <b>конечную</b> дату.\n"
+        "<i>Отправьте «-», чтобы взять тот же день.</i>",
+        parse_mode="HTML",
+    )
 
 
-@router.callback_query(F.data.startswith("hw:"))
-async def attach_hw_start(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    user = db.get_user(callback.from_user.id)
-    if not user or user["role"] != "teacher":
-        await callback.answer("❌ Доступно только преподавателям.", show_alert=True)
+@router.message(ManagerSummaryStates.waiting_for_date_to, F.text)
+async def summary_date_to(
+    message: Message, state: FSMContext, db: Database, alfacrm: AlfaCRMClient
+) -> None:
+    if not _is_manager(message.from_user.id):
+        await state.clear()
         return
 
-    lesson_id = int(callback.data.split(":")[1])
-    await state.update_data(lesson_id=lesson_id)
-    await state.set_state(HomeworkStates.waiting_for_text_or_file)
-    await callback.message.answer("📝 Отправьте текст или файл ДЗ.")
-    await callback.answer()
-
-
-@router.message(HomeworkStates.waiting_for_text_or_file, F.text)
-async def attach_hw_text(message: Message, state: FSMContext, alfacrm: AlfaCRMClient) -> None:
     data = await state.get_data()
-    try:
-        await alfacrm.set_homework(data["lesson_id"], message.text)
-        await message.answer("✅ ДЗ сохранено!")
-    except AlfaCRMError as e:
-        await message.answer(f"❌ Ошибка: {e}")
-    await state.clear()
+    date_from = data["date_from"]
 
-
-@router.message(HomeworkStates.waiting_for_text_or_file, F.document | F.photo)
-async def attach_hw_file(message: Message, state: FSMContext, db: Database, alfacrm: AlfaCRMClient) -> None:
-    data = await state.get_data()
-    lesson_id = data["lesson_id"]
-
-    if message.document:
-        file_id = message.document.file_id
-        file_name = message.document.file_name or "файл"
-        file_type = "document"
+    if message.text.strip() in ("-", "—"):
+        date_to = date_from
     else:
-        file_id = message.photo[-1].file_id
-        file_name = "фото"
-        file_type = "photo"
+        parsed = _parse_date(message.text)
+        if not parsed:
+            await message.answer(
+                "❌ Не понял дату. Введите как <b>ГГГГ-ММ-ДД</b> или <b>ДД.ММ.ГГГГ</b>",
+                parse_mode="HTML",
+            )
+            return
+        date_to = parsed.isoformat()
 
-    db.add_homework_file(lesson_id, file_id, file_name, file_type)
+    await state.clear()
+
+    if date_to < date_from:
+        date_from, date_to = date_to, date_from
+
+    await message.answer("🔍 Собираю сводку…")
+    logger.info(f"📅 Сводка за {date_from} – {date_to} (branch_id={BRANCH_ID})")
 
     try:
-        lesson = await alfacrm.get_lesson(lesson_id)
-        existing_hw = (lesson or {}).get("homework", "")
-        note = f"\n[📎 {file_name}]"
-        await alfacrm.set_homework(lesson_id, f"{existing_hw}{note}" if existing_hw else note)
-        await message.answer(f"✅ Файл прикреплён!")
-    except AlfaCRMError as e:
-        await message.answer(f"⚠️ Файл сохранён локально. Ошибка CRM: {e}")
-    
-    await state.clear()
-
-
-@router.callback_query(F.data.startswith("transfer:"))
-async def transfer_start(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
-    user = db.get_user(callback.from_user.id)
-    if not user or user["role"] != "teacher":
-        await callback.answer("❌ Доступно только преподавателям.", show_alert=True)
+        all_lessons = await alfacrm.get_lessons(date_from=date_from, date_to=date_to)
+        lessons = [l for l in all_lessons if date_from <= lesson_date_iso(l) <= date_to]
+        logger.info(f"📊 Получено {len(all_lessons)}, после фильтра по датам {len(lessons)}")
+    except Exception as e:
+        logger.error(f"❌ Ошибка получения уроков: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка получения уроков: {e}")
         return
 
-    lesson_id = int(callback.data.split(":")[1])
-    await state.update_data(lesson_id=lesson_id)
-    await state.set_state(TransferStates.waiting_for_comment)
-    await callback.message.answer("🔁 Напишите желаемую дату/время и причину переноса.")
-    await callback.answer()
+    if date_from == date_to:
+        period_label = f"за {fmt_date_long(datetime.strptime(date_from, '%Y-%m-%d').date())}"
+    else:
+        period_label = f"за период {date_from} – {date_to}"
 
+    try:
+        blocks = await get_lesson_summary(lessons, db, alfacrm, period_label)
+    except Exception as e:
+        logger.error(f"❌ Ошибка формирования сводки: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка формирования сводки: {e}")
+        return
 
-@router.message(TransferStates.waiting_for_comment, F.text)
-async def transfer_finish(message: Message, state: FSMContext, db: Database) -> None:
-    data = await state.get_data()
-    request_id = db.create_transfer_request(message.from_user.id, data["lesson_id"], message.text)
-
-    for manager_id in MANAGER_IDS:
-        try:
-            await message.bot.send_message(
-                manager_id,
-                f"🔁 Заявка на перенос #{request_id}\n"
-                f"👨‍🏫 {message.from_user.full_name}\n"
-                f"📅 Урок ID: {data['lesson_id']}\n"
-                f"💬 {message.text}",
-                reply_markup=transfer_decision_keyboard(request_id),
-            )
-        except Exception:
-            pass
-
-    await message.answer("✅ Заявка отправлена менеджеру.")
-    await state.clear()
+    try:
+        await answer_blocks(message, blocks)
+        logger.info(f"✅ Сводка отправлена ({len(blocks)} сообщений)")
+    except Exception as e:
+        logger.error(f"❌ Ошибка отправки сообщения: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка отправки: {e}")
